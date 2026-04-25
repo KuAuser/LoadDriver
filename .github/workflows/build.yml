@@ -1,0 +1,95 @@
+name: Build Paradise KO (Matrix)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+
+    container:
+      image: ghcr.io/ylarod/ddk:${{ matrix.target }}
+      options: --platform linux/amd64
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Show toolchain env
+        run: |
+          echo "Target: ${{ matrix.target }}"
+          echo "KDIR=${KDIR}"
+          echo "CLANG_PATH=${CLANG_PATH}"
+          echo "CROSS_COMPILE=${CROSS_COMPILE}"
+          echo "ARCH=${ARCH}"
+          which clang || true
+          clang --version || true
+          uname -a
+
+      - name: Build kernel module
+        run: |
+          set -e
+          make -j"$(nproc)" all
+          echo "--- listing produced .ko ---"
+          find . -maxdepth 3 -name '*.ko' -print
+
+      - name: Rename artifact
+        run: |
+          set -e
+          mkdir -p out
+          if [ -f paradise.ko ]; then
+            cp paradise.ko "out/paradise-${{ matrix.target }}.ko"
+          else
+            echo "::error::paradise.ko not found"
+            exit 1
+          fi
+          ls -lh out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paradise-${{ matrix.target }}
+          path: out/paradise-${{ matrix.target }}.ko
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect .ko files
+        run: |
+          mkdir -p release
+          find artifacts -name '*.ko' -exec cp -v {} release/ \;
+          ls -lh release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.ko
+          generate_release_notes: true

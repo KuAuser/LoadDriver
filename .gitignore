@@ -1,0 +1,23 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+.modinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Userspace example library (contains client-side ABI / magic exposure)
+paradise_driver_lib/
+
+# Build outputs
+out/
+build/
