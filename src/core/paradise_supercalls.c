@@ -106,6 +106,15 @@ static long paradise_anon_ioctl(struct file *filp, unsigned int cmd, unsigned lo
     case PARADISE_IOCTL_TOUCH_DESTROY:
         ret = do_touch_destroy(argp);
         break;
+    /* ARM64 hardware breakpoint subsystem (paradise_hwbp.{h,c}).
+     * 之前漏在这里 dispatch, 导致 ioctl 25/26 全部走 default → -ENOTTY.
+     * 函数声明来自 paradise_hwbp.h, 已通过 paradise_ioctl.h 间接 include. */
+    case PARADISE_IOCTL_HW_BREAKPOINT_CTL:
+        ret = do_hw_breakpoint_ctl(argp);
+        break;
+    case PARADISE_IOCTL_HW_BREAKPOINT_GET_HITS:
+        ret = do_hw_breakpoint_get_hits(argp);
+        break;
     default:
         current_paradise_file = old_file;
         paradise_debug("paradise ioctl: unsupported command 0x%x\n", cmd);

@@ -11,6 +11,7 @@ paradise-y := \
     src/utils/karray_list.o \
     src/utils/cvector.o \
     src/touch/paradise_touch.o \
+    src/breakpoint/paradise_hwbp.o \
 
 src := $(if $(filter /%,$(src)),$(src),$(srctree)/$(src))
 
@@ -24,7 +25,7 @@ $(info -- PARADISE_OBJ_DIR: $(obj))
 
 ccflags-y += -I$(src)/src/core -I$(src)/src/net -I$(src)/src/ioctl -I$(src)/src/mm
 ccflags-y += -I$(src)/src/inlinehook -I$(src)/src/proc -I$(src)/src/utils -I$(src)/src/gyro
-ccflags-y += -I$(src)/src/touch
+ccflags-y += -I$(src)/src/touch -I$(src)/src/breakpoint
 
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable

@@ -1,0 +1,21 @@
+Captured via adb for matching DDK Docker tag (same as CI matrix android15-6.6).
+
+adb devices:
+  4589cf2d device product:PKR110 model:PKR110 device:OP60EBL1
+
+getprop:
+  ro.product.model = PKR110
+  ro.build.version.release = 15
+  ro.build.fingerprint = OnePlus/PKR110/OP60EBL1:15/AP3A.240617.008/V.21dbc98-3e5af3-3ecaa5:user/release-keys
+
+uname -a / uname -r:
+  Linux localhost 6.6.30-android15-8-g013ec21bba94-abogki383916444-4k #1 SMP PREEMPT Tue Dec 17 23:36:49 UTC 2024 aarch64
+  6.6.30-android15-8-g013ec21bba94-abogki383916444-4k
+
+/proc/version (toolchain excerpt):
+  ... (Android (...) clang version 18.0.0 ...), LLD 18.0.0 ...
+
+/proc/config.gz:
+  CONFIG_LOCALVERSION="-android15-8-g013ec21bba94-abogki383916444-4k"
+
+CI reference: .github/workflows/build.yml uses image ghcr.io/ylarod/ddk:android15-6.6

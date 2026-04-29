@@ -1,0 +1,320 @@
+/*
+ * paradise_hwbp.c --- ARM64 硬件断点子系统实现
+ *
+ * 关键约束:
+ *   - hwbp_overflow_handler() 跑在 IRQ/NMI 上下文:
+ *       不能 sleep, 不能取 mutex, 不能 copy_to_user.
+ *       只能用 spinlock_irqsave + atomic + memcpy.
+ *   - register_wide_hw_breakpoint() / unregister_wide_hw_breakpoint() 可以 sleep,
+ *     必须在进程上下文 (IOCTL 处理) 里调, 不能在 handler 里调.
+ *   - ARM64 上 struct pt_regs 的前 35 个 u64 跟 struct user_pt_regs 完全一致
+ *     (regs[31] + sp + pc + pstate), 可以直接 memcpy(sizeof(user_pt_regs)).
+ */
+#include "paradise_hwbp.h"
+#include "paradise_common.h"
+
+#include <linux/atomic.h>
+#include <linux/hw_breakpoint.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/perf_event.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/ktime.h>
+#include <linux/err.h>
+
+/* ============================================================================
+ * 数据结构
+ * ========================================================================== */
+
+/* 一条已注册的硬件断点. CPU-wide, 一个 entry 对应所有 CPU 上的 perf_event 数组. */
+struct hwbp_entry {
+    struct list_head node;
+    pid_t target_pid;                       /* hit handler 用来过滤 */
+    uintptr_t addr;
+    int type;                               /* HW_BP_TYPE_* */
+    int len;
+    struct perf_event * __percpu *events;   /* register_wide_hw_breakpoint 返回 */
+};
+
+static LIST_HEAD(g_hwbp_list);
+static DEFINE_MUTEX(g_hwbp_mutex);          /* 保护 g_hwbp_list (add/remove) */
+
+/* ---- hits ring buffer (handler push, ioctl pop) ----
+ *
+ * 容量 1024 条, 单条 304 字节 → 内核常驻 ~304 KiB. 60fps 下游戏单帧 5-10
+ * 命中, 1024 条容量足够 ~10 秒缓冲, 用户态每帧 ioctl 拉一次完全够用.
+ */
+#define HWBP_RING_SIZE 1024
+
+static struct paradise_hw_breakpoint_hit_info g_hits_ring[HWBP_RING_SIZE];
+static u32 g_hits_head;                     /* 下次写入位置 */
+static u32 g_hits_tail;                     /* 下次读取位置 */
+static u32 g_hits_count;                    /* 当前条数 (受 g_hits_lock 保护) */
+static u64 g_hits_dropped_total;            /* ring 满时丢弃的累计条数 (诊断用) */
+static DEFINE_SPINLOCK(g_hits_lock);
+
+/* ============================================================================
+ * Hit handler (NMI/IRQ 上下文)
+ * ========================================================================== */
+
+static void hwbp_overflow_handler(struct perf_event *bp,
+                                  struct perf_sample_data *data,
+                                  struct pt_regs *regs)
+{
+    struct hwbp_entry *e;
+    struct paradise_hw_breakpoint_hit_info *slot;
+    unsigned long flags;
+    pid_t cur_tgid;
+
+    if (!bp || !regs) return;
+
+    /* register_wide_hw_breakpoint 把 context 设到每 cpu perf_event 的
+     * overflow_handler_context 上. 我们在 add 路径传的就是 hwbp_entry*. */
+    e = (struct hwbp_entry *)bp->overflow_handler_context;
+    if (!e) return;
+
+    /* 过滤: 只接目标进程 tgid (handler 跑在被中断 task 的上下文, current 是它).
+     * 跨进程 same-VA 命中 (例如分身进程) 直接丢弃, 不污染 ring. */
+    cur_tgid = current ? current->tgid : 0;
+    if (cur_tgid != e->target_pid) return;
+
+    /* 入队. handler 上下文不能 sleep, 用 spin_lock_irqsave (跟其他 handler 在
+     * 不同 CPU 互斥). lock 内只做定长 memcpy + 4 个标量更新, 短小. */
+    spin_lock_irqsave(&g_hits_lock, flags);
+
+    if (g_hits_count >= HWBP_RING_SIZE) {
+        /* 满了: 丢最老一条 (前进 tail), 保留最新. 这种"覆盖式"行为对实时
+         * 监控更友好, 下游不会因为延迟拉取就拿到一堆几秒前的旧坐标. */
+        g_hits_tail = (g_hits_tail + 1) % HWBP_RING_SIZE;
+        g_hits_count--;
+        g_hits_dropped_total++;
+    }
+
+    slot = &g_hits_ring[g_hits_head];
+    slot->pid       = cur_tgid;
+    slot->timestamp = ktime_get_ns();
+    slot->addr      = e->addr;
+    /* ARM64: pt_regs 的前 35 个 u64 跟 user_pt_regs 完全一致, 直接 memcpy. */
+    memcpy(&slot->regs, regs, sizeof(struct user_pt_regs));
+
+    g_hits_head = (g_hits_head + 1) % HWBP_RING_SIZE;
+    g_hits_count++;
+
+    spin_unlock_irqrestore(&g_hits_lock, flags);
+}
+
+/* ============================================================================
+ * ADD / REMOVE
+ * ========================================================================== */
+
+static int translate_bp_type(int user_type, int *kernel_bp_type)
+{
+    switch (user_type) {
+    case HW_BP_TYPE_EXECUTE: *kernel_bp_type = HW_BREAKPOINT_X;  return 0;
+    case HW_BP_TYPE_WRITE:   *kernel_bp_type = HW_BREAKPOINT_W;  return 0;
+    case HW_BP_TYPE_RW:      *kernel_bp_type = HW_BREAKPOINT_RW; return 0;
+    default: return -EINVAL;
+    }
+}
+
+static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
+{
+    struct perf_event_attr attr;
+    struct hwbp_entry *e;
+    struct perf_event * __percpu *events;
+    int kernel_bp_type;
+    int ret;
+
+    if (target_pid <= 0) return -EINVAL;
+    if (addr == 0)       return -EINVAL;
+
+    if (len != 1 && len != 2 && len != 4 && len != 8) return -EINVAL;
+    ret = translate_bp_type(type, &kernel_bp_type);
+    if (ret) return ret;
+
+    /* 重复 ADD 同一 (pid, addr) 直接返回成功 (幂等). */
+    mutex_lock(&g_hwbp_mutex);
+    list_for_each_entry(e, &g_hwbp_list, node) {
+        if (e->target_pid == target_pid && e->addr == addr) {
+            mutex_unlock(&g_hwbp_mutex);
+            paradise_info("hwbp_add: dup (pid=%d addr=0x%lx) -> ok\n",
+                          target_pid, (unsigned long)addr);
+            return 0;
+        }
+    }
+    mutex_unlock(&g_hwbp_mutex);
+
+    e = kzalloc(sizeof(*e), GFP_KERNEL);
+    if (!e) return -ENOMEM;
+    e->target_pid = target_pid;
+    e->addr = addr;
+    e->type = type;
+    e->len = len;
+
+    hw_breakpoint_init(&attr);
+    attr.bp_addr = addr;
+    attr.bp_len  = len;
+    attr.bp_type = kernel_bp_type;
+    attr.disabled = 0;
+
+    /* CPU-wide: 内核给每个 CPU 装一个 perf_event, 任意 CPU 上跑到这条指令都
+     * 触发 handler. 不绑特定 task, 新 thread 自动覆盖. */
+    events = register_wide_hw_breakpoint(&attr, hwbp_overflow_handler, e);
+    if (IS_ERR_OR_NULL(events)) {
+        ret = events ? PTR_ERR(events) : -EFAULT;
+        paradise_err("register_wide_hw_breakpoint failed: %d (pid=%d addr=0x%lx type=%d len=%d)\n",
+                     ret, target_pid, (unsigned long)addr, type, len);
+        kfree(e);
+        return ret;
+    }
+    e->events = events;
+
+    mutex_lock(&g_hwbp_mutex);
+    list_add(&e->node, &g_hwbp_list);
+    mutex_unlock(&g_hwbp_mutex);
+
+    paradise_info("hwbp_add: pid=%d addr=0x%lx type=%d len=%d ok\n",
+                  target_pid, (unsigned long)addr, type, len);
+    return 0;
+}
+
+static int hwbp_remove(pid_t target_pid, uintptr_t addr)
+{
+    struct hwbp_entry *e, *tmp, *found = NULL;
+
+    mutex_lock(&g_hwbp_mutex);
+    list_for_each_entry_safe(e, tmp, &g_hwbp_list, node) {
+        if (e->target_pid == target_pid && e->addr == addr) {
+            list_del(&e->node);
+            found = e;
+            break;
+        }
+    }
+    mutex_unlock(&g_hwbp_mutex);
+
+    if (!found) {
+        paradise_warn("hwbp_remove: not found (pid=%d addr=0x%lx)\n",
+                      target_pid, (unsigned long)addr);
+        return -ENOENT;
+    }
+
+    /* unregister_wide_hw_breakpoint 可能 sleep, 必须在锁外调. */
+    unregister_wide_hw_breakpoint(found->events);
+    kfree(found);
+
+    paradise_info("hwbp_remove: pid=%d addr=0x%lx ok\n",
+                  target_pid, (unsigned long)addr);
+    return 0;
+}
+
+/* ============================================================================
+ * IOCTL handlers (进程上下文, 可以 copy_*_user / mutex)
+ * ========================================================================== */
+
+int do_hw_breakpoint_ctl(void __user *arg)
+{
+    struct paradise_hw_breakpoint_ctl_cmd cmd;
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd))) return -EFAULT;
+
+    switch (cmd.action) {
+    case HW_BP_ADD:
+        return hwbp_add(cmd.pid, cmd.addr, cmd.type, cmd.len);
+    case HW_BP_REMOVE:
+        return hwbp_remove(cmd.pid, cmd.addr);
+    default:
+        paradise_err("hw_breakpoint_ctl: invalid action=%d\n", cmd.action);
+        return -EINVAL;
+    }
+}
+
+int do_hw_breakpoint_get_hits(void __user *arg)
+{
+    struct paradise_hw_breakpoint_get_hits_cmd cmd;
+    void __user *uptr;
+    void *staging;
+    size_t want;
+    size_t cap;
+    size_t got;
+    unsigned long flags;
+    static const size_t HIT_SZ = sizeof(struct paradise_hw_breakpoint_hit_info);
+    /* 单次 IOCTL 最多取多少条. 256 * 304 = 76 KiB kmalloc, 在限制内 (<128 KiB). */
+    static const size_t MAX_PER_CALL = 256;
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd))) return -EFAULT;
+
+    uptr = (void __user *)cmd.buffer;
+    want = cmd.count;
+
+    if (!uptr || want == 0) {
+        cmd.count = 0;
+        return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
+    }
+
+    cap = (want < MAX_PER_CALL) ? want : MAX_PER_CALL;
+    staging = kmalloc(cap * HIT_SZ, GFP_KERNEL);
+    if (!staging) return -ENOMEM;
+
+    /* spinlock 内只做定长 memcpy, 不做 copy_to_user (它可以 page fault → sleep). */
+    got = 0;
+    spin_lock_irqsave(&g_hits_lock, flags);
+    while (got < cap && g_hits_count > 0) {
+        memcpy((char *)staging + got * HIT_SZ,
+               &g_hits_ring[g_hits_tail],
+               HIT_SZ);
+        g_hits_tail = (g_hits_tail + 1) % HWBP_RING_SIZE;
+        g_hits_count--;
+        got++;
+    }
+    spin_unlock_irqrestore(&g_hits_lock, flags);
+
+    if (got > 0) {
+        if (copy_to_user(uptr, staging, got * HIT_SZ)) {
+            /* 数据已出 ring 但用户拷贝失败 → 这批数据丢. 客户端通过 -EFAULT
+             * 知道失败, 不再依赖 cmd.count. */
+            kfree(staging);
+            return -EFAULT;
+        }
+    }
+    kfree(staging);
+
+    cmd.count = got;
+    if (copy_to_user(arg, &cmd, sizeof(cmd))) return -EFAULT;
+    return 0;
+}
+
+/* ============================================================================
+ * 子系统生命周期
+ * ========================================================================== */
+
+int paradise_hwbp_init(void)
+{
+    g_hits_head = g_hits_tail = g_hits_count = 0;
+    g_hits_dropped_total = 0;
+    paradise_info("hwbp init: ring=%d entries (%zu KiB)\n",
+                  HWBP_RING_SIZE,
+                  (size_t)(HWBP_RING_SIZE * sizeof(struct paradise_hw_breakpoint_hit_info) / 1024));
+    return 0;
+}
+
+void paradise_hwbp_exit(void)
+{
+    struct hwbp_entry *e, *tmp;
+
+    mutex_lock(&g_hwbp_mutex);
+    list_for_each_entry_safe(e, tmp, &g_hwbp_list, node) {
+        list_del(&e->node);
+        /* unregister 可能 sleep, mutex 持有期间不能 sleep? mutex 可以 sleep, 没问题.
+         * (非 spinlock, 内核里 mutex 持有时是允许调度的). */
+        unregister_wide_hw_breakpoint(e->events);
+        kfree(e);
+    }
+    mutex_unlock(&g_hwbp_mutex);
+
+    paradise_info("hwbp exit: cleaned, dropped_total=%llu\n",
+                  (unsigned long long)g_hits_dropped_total);
+}

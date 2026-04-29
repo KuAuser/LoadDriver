@@ -3,6 +3,7 @@
 
 #include "paradise_common.h"
 #include "paradise_touch.h"
+#include "paradise_hwbp.h"
 #include <asm/ptrace.h>
 
 struct paradise_memory_rw_cmd {
@@ -100,6 +101,9 @@ struct paradise_touch_event_cmd {
 #define PARADISE_IOCTL_TOUCH_INIT     _IOR('W', 30, struct paradise_touch_init_cmd)
 #define PARADISE_IOCTL_TOUCH_EVENT    _IOW('W', 31, struct paradise_touch_event_cmd)
 #define PARADISE_IOCTL_TOUCH_DESTROY  _IO('W', 32)
+/* IOCTL commands for ARM64 hardware breakpoints (see src/breakpoint/paradise_hwbp.h) */
+#define PARADISE_IOCTL_HW_BREAKPOINT_CTL      _IOWR('W', 25, struct paradise_hw_breakpoint_ctl_cmd)
+#define PARADISE_IOCTL_HW_BREAKPOINT_GET_HITS _IOWR('W', 26, struct paradise_hw_breakpoint_get_hits_cmd)
 
 int do_read_physical_memory(void __user* arg);
 int do_get_module_base(void __user* arg);
@@ -130,6 +134,8 @@ static const struct ioctl_cmd_map {
     {.cmd = PARADISE_IOCTL_TOUCH_INIT, .handler = do_touch_init},
     {.cmd = PARADISE_IOCTL_TOUCH_EVENT, .handler = do_touch_event},
     {.cmd = PARADISE_IOCTL_TOUCH_DESTROY, .handler = do_touch_destroy},
+    {.cmd = PARADISE_IOCTL_HW_BREAKPOINT_CTL,      .handler = do_hw_breakpoint_ctl},
+    {.cmd = PARADISE_IOCTL_HW_BREAKPOINT_GET_HITS, .handler = do_hw_breakpoint_get_hits},
     {.cmd = 0, .handler = NULL} /* Sentinel to mark end of array */
 };
 
