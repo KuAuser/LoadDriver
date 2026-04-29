@@ -176,27 +176,35 @@ static int translate_bp_type(int user_type, int *kernel_bp_type)
     }
 }
 
-/* hwbp_add: 只装到 target_pid 的 main thread (group leader).
+/* hwbp_add: 装 BP 到 target_pid 进程的 UnityMain 线程 (王者荣耀基于 Unity).
  *
- * 设计变更 (2026-04-30):
+ * 设计演进:
  *   v1 装 274 个 thread → 222 万 hit/s, handler 烧 CPU, 游戏卡死.
- *   v2 改成只装 main thread 一个: hit 频率降到 274 倍以下 (≤ 8 K/s),
- *      handler CPU 占用 < 0.5%.
+ *   v2 只装 main thread (Java 主线程)  → acc=0, java thread 根本不跑 native cached_plain.X.
+ *   v3 (本版) 装 comm 前缀为 "UnityMain" 的 thread (王者实测 6 个).
+ *      sgame 是 Unity 引擎, 写 cached_plain.X 的 STR X10 在 UnityMain 上执行.
+ *      没匹配 → fallback 到 group leader (向后兼容, 不至于完全静默).
  *
- *   后果: 如果游戏的写坐标 thread 不是 main thread, hits 会是 0.
- *   命中后 slot->pid 字段填的是 task->pid (tid), 用户态可以打印分布
- *   验证是否猜对. 错了再改 IOCTL 让客户端传 tid 自定义.
+ *   维护提示: 如果别的游戏 (非 Unity) 用同一驱动, 这里要改成可配置. 现在
+ *   先 hardcode 王者荣耀路径, 务实优先.
  */
+#define HWBP_TARGET_THREAD_PREFIX "UnityMain"
+#define HWBP_TARGET_THREAD_PREFIX_LEN 9
+#define HWBP_MAX_THREADS_PER_ADD 32
+
 static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
 {
     struct perf_event_attr attr;
     struct hwbp_entry *e;
     struct pid *pidp;
-    struct task_struct *leader;
-    struct perf_event *bp;
-    struct hwbp_thread_bp *tb;
+    struct task_struct *leader, *t;
+    struct task_struct **tasks = NULL;
+    char comm_local[TASK_COMM_LEN];
+    int n_tasks = 0;
     int kernel_bp_type;
     int ret;
+    int i;
+    int reg_ok = 0, reg_fail = 0;
 
     if (target_pid <= 0) return -EINVAL;
     if (addr == 0)       return -EINVAL;
@@ -217,17 +225,50 @@ static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
     }
     mutex_unlock(&g_hwbp_mutex);
 
-    /* 拿到目标进程的 group leader (= main thread, task->pid == task->tgid). */
+    /* 1) 拿到目标进程的 group leader. */
     pidp = find_get_pid(target_pid);
     if (!pidp) return -ESRCH;
     leader = get_pid_task(pidp, PIDTYPE_TGID);
     put_pid(pidp);
     if (!leader) return -ESRCH;
 
-    /* 分配 entry, 准备 attr. */
+    tasks = kzalloc(sizeof(*tasks) * HWBP_MAX_THREADS_PER_ADD, GFP_KERNEL);
+    if (!tasks) {
+        put_task_struct(leader);
+        return -ENOMEM;
+    }
+
+    /* 2) 在 RCU 保护下扫线程组, 只挑 comm 前缀匹配 UnityMain 的 task.
+     *    perf_event_create_kernel_counter 内部会 sleep, 不能在 RCU 内调,
+     *    所以这里只 get_task_struct() 取引用, 注册留到锁外. */
+    rcu_read_lock();
+    for_each_thread(leader, t) {
+        if (n_tasks >= HWBP_MAX_THREADS_PER_ADD) break;
+        /* t->comm 字段 16 字节, prctl 改名时短暂 race, 拷出来再比. */
+        memcpy(comm_local, t->comm, TASK_COMM_LEN);
+        comm_local[TASK_COMM_LEN - 1] = '\0';
+        if (strncmp(comm_local, HWBP_TARGET_THREAD_PREFIX,
+                    HWBP_TARGET_THREAD_PREFIX_LEN) == 0) {
+            get_task_struct(t);
+            tasks[n_tasks++] = t;
+        }
+    }
+    rcu_read_unlock();
+
+    /* 3) fallback: 没找到 UnityMain → 装到 group leader, 至少不会完全静默 */
+    if (n_tasks == 0) {
+        get_task_struct(leader);
+        tasks[n_tasks++] = leader;
+        paradise_warn("hwbp_add: no '%s*' thread found, fallback to group leader (tid=%d)\n",
+                      HWBP_TARGET_THREAD_PREFIX, leader->pid);
+    }
+    put_task_struct(leader);
+
+    /* 4) 分配 entry. */
     e = kzalloc(sizeof(*e), GFP_KERNEL);
     if (!e) {
-        put_task_struct(leader);
+        for (i = 0; i < n_tasks; i++) put_task_struct(tasks[i]);
+        kfree(tasks);
         return -ENOMEM;
     }
     e->target_pid = target_pid;
@@ -242,39 +283,66 @@ static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
     attr.bp_type = kernel_bp_type;
     attr.disabled = 0;
 
-    /* 只装 main thread 一个. perf_event_create_kernel_counter 内部会 sleep,
-     * 不能在 RCU 内调; 所以我们通过 PIDTYPE_TGID 直接拿到 leader 的 task_struct
-     * 引用, 不进 RCU 也能保引用有效. */
-    bp = kfn_register_user_hw_breakpoint(&attr, hwbp_overflow_handler, e, leader);
-    if (IS_ERR_OR_NULL(bp)) {
-        ret = bp ? PTR_ERR(bp) : -EFAULT;
-        paradise_err("hwbp_add: register on main thread failed: ret=%d (pid=%d tid=%d addr=0x%lx)\n",
-                     ret, target_pid, leader->pid, (unsigned long)addr);
-        put_task_struct(leader);
+    /* 5) per-thread 注册. */
+    for (i = 0; i < n_tasks; i++) {
+        struct perf_event *bp;
+        struct hwbp_thread_bp *tb;
+
+        bp = kfn_register_user_hw_breakpoint(&attr, hwbp_overflow_handler, e, tasks[i]);
+        if (IS_ERR_OR_NULL(bp)) {
+            paradise_warn("hwbp_add: register failed on tid=%d ret=%ld\n",
+                          tasks[i]->pid, bp ? PTR_ERR(bp) : -EFAULT);
+            reg_fail++;
+            put_task_struct(tasks[i]);
+            continue;
+        }
+        tb = kzalloc(sizeof(*tb), GFP_KERNEL);
+        if (!tb) {
+            kfn_unregister_hw_breakpoint(bp);
+            reg_fail++;
+            put_task_struct(tasks[i]);
+            continue;
+        }
+        tb->bp  = bp;
+        tb->tid = tasks[i]->pid;
+        INIT_LIST_HEAD(&tb->node);
+        list_add(&tb->node, &e->thread_bps);
+        reg_ok++;
+        put_task_struct(tasks[i]);
+    }
+    kfree(tasks);
+
+    if (reg_ok == 0) {
+        paradise_err("hwbp_add: all per-thread registers failed (pid=%d addr=0x%lx fail=%d)\n",
+                     target_pid, (unsigned long)addr, reg_fail);
         kfree(e);
-        return ret;
+        return -EFAULT;
     }
 
-    tb = kzalloc(sizeof(*tb), GFP_KERNEL);
-    if (!tb) {
-        kfn_unregister_hw_breakpoint(bp);
-        put_task_struct(leader);
-        kfree(e);
-        return -ENOMEM;
-    }
-    tb->bp  = bp;
-    tb->tid = leader->pid;
-    INIT_LIST_HEAD(&tb->node);
-    list_add(&tb->node, &e->thread_bps);
-    e->thread_count = 1;
+    e->thread_count = reg_ok;
 
     mutex_lock(&g_hwbp_mutex);
     list_add(&e->node, &g_hwbp_list);
     mutex_unlock(&g_hwbp_mutex);
 
-    paradise_info("hwbp_add: pid=%d addr=0x%lx type=%d len=%d -> main_thread tid=%d\n",
-                  target_pid, (unsigned long)addr, type, len, leader->pid);
-    put_task_struct(leader);
+    /* 列出所有装上的 tid, 方便用户态 / dmesg 验证. */
+    {
+        struct hwbp_thread_bp *p;
+        char tids_str[128];
+        int off = 0;
+        list_for_each_entry(p, &e->thread_bps, node) {
+            int n = snprintf(tids_str + off, sizeof(tids_str) - off, "%d,", p->tid);
+            if (n <= 0 || off + n >= (int)sizeof(tids_str) - 1) break;
+            off += n;
+        }
+        if (off > 0) tids_str[off - 1] = '\0';     /* 去末尾逗号 */
+        else         tids_str[0] = '\0';
+
+        paradise_info("hwbp_add: pid=%d addr=0x%lx type=%d len=%d "
+                      "ok=%d skipped=%d tids=[%s]\n",
+                      target_pid, (unsigned long)addr, type, len,
+                      reg_ok, reg_fail, tids_str);
+    }
     return 0;
 }
 
