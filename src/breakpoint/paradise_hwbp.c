@@ -12,6 +12,7 @@
  */
 #include "paradise_hwbp.h"
 #include "paradise_common.h"
+#include "paradise_utils.h"   /* kallsyms_lookup_name_ex */
 
 #include <linux/atomic.h>
 #include <linux/hw_breakpoint.h>
@@ -25,6 +26,32 @@
 #include <linux/uaccess.h>
 #include <linux/ktime.h>
 #include <linux/err.h>
+
+/* ============================================================================
+ * GKI Protected Symbols 绕道
+ * ============================================================================
+ * OPlus/某些 GKI 内核把 register_user_hw_breakpoint / unregister_hw_breakpoint
+ * 当作 protected symbol — 外部模块直接 EXPORT_SYMBOL_GPL 链接会被
+ * modpost+modload 拒掉:
+ *   paradise: Protected symbol: register_user_hw_breakpoint (err -13)
+ *   paradise: Protected symbol: unregister_hw_breakpoint    (err -13)
+ *
+ * 唯一可行的绕道是不在 .c 里做任何对这两个符号的链接级引用, 改成在
+ * paradise_hwbp_init() 里通过 kallsyms_lookup_name_ex() 解析它们的函数地址,
+ * 然后用函数指针调用. modpost 看不到引用 → 不会进 unresolved → modload 不会
+ * 触发 protected symbol 拒绝.
+ *
+ * register_wide_hw_breakpoint 在该 OEM KMI 白名单里, 没有这个限制.
+ * ========================================================================== */
+typedef struct perf_event * (*register_user_hw_breakpoint_t)(
+    struct perf_event_attr *attr,
+    perf_overflow_handler_t triggered,
+    void *context,
+    struct task_struct *tsk);
+typedef void (*unregister_hw_breakpoint_t)(struct perf_event *bp);
+
+static register_user_hw_breakpoint_t kfn_register_user_hw_breakpoint;
+static unregister_hw_breakpoint_t    kfn_unregister_hw_breakpoint;
 
 /* ============================================================================
  * 数据结构
@@ -233,7 +260,7 @@ static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
         struct perf_event *bp;
         struct hwbp_thread_bp *tb;
 
-        bp = register_user_hw_breakpoint(&attr, hwbp_overflow_handler, e, tasks[i]);
+        bp = kfn_register_user_hw_breakpoint(&attr, hwbp_overflow_handler, e, tasks[i]);
         if (IS_ERR_OR_NULL(bp)) {
             reg_fail++;
             put_task_struct(tasks[i]);
@@ -241,7 +268,7 @@ static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
         }
         tb = kzalloc(sizeof(*tb), GFP_KERNEL);
         if (!tb) {
-            unregister_hw_breakpoint(bp);
+            kfn_unregister_hw_breakpoint(bp);
             reg_fail++;
             put_task_struct(tasks[i]);
             continue;
@@ -296,7 +323,7 @@ static int hwbp_remove(pid_t target_pid, uintptr_t addr)
     /* unregister_hw_breakpoint 可能 sleep, 必须在锁外调. */
     list_for_each_entry_safe(tb, tb_tmp, &found->thread_bps, node) {
         list_del(&tb->node);
-        if (tb->bp) unregister_hw_breakpoint(tb->bp);
+        if (tb->bp) kfn_unregister_hw_breakpoint(tb->bp);
         kfree(tb);
     }
     kfree(found);
@@ -390,9 +417,26 @@ int paradise_hwbp_init(void)
 {
     g_hits_head = g_hits_tail = g_hits_count = 0;
     g_hits_dropped_total = 0;
-    paradise_info("hwbp init: ring=%d entries (%zu KiB)\n",
+
+    /* GKI Protected Symbols 绕道: 通过 kallsyms 拿函数指针, 不在 modpost 链接表
+     * 里产生 register_user_hw_breakpoint / unregister_hw_breakpoint 的引用. */
+    kfn_register_user_hw_breakpoint = (register_user_hw_breakpoint_t)
+        kallsyms_lookup_name_ex("register_user_hw_breakpoint");
+    kfn_unregister_hw_breakpoint = (unregister_hw_breakpoint_t)
+        kallsyms_lookup_name_ex("unregister_hw_breakpoint");
+
+    if (!kfn_register_user_hw_breakpoint || !kfn_unregister_hw_breakpoint) {
+        paradise_err("hwbp init: kallsyms_lookup failed: register_user=%px unregister=%px\n",
+                     kfn_register_user_hw_breakpoint,
+                     kfn_unregister_hw_breakpoint);
+        return -ENOENT;
+    }
+
+    paradise_info("hwbp init: ring=%d entries (%zu KiB), register_user=%px unregister=%px\n",
                   HWBP_RING_SIZE,
-                  (size_t)(HWBP_RING_SIZE * sizeof(struct paradise_hw_breakpoint_hit_info) / 1024));
+                  (size_t)(HWBP_RING_SIZE * sizeof(struct paradise_hw_breakpoint_hit_info) / 1024),
+                  kfn_register_user_hw_breakpoint,
+                  kfn_unregister_hw_breakpoint);
     return 0;
 }
 
@@ -406,7 +450,7 @@ void paradise_hwbp_exit(void)
         list_del(&e->node);
         list_for_each_entry_safe(tb, tb_tmp, &e->thread_bps, node) {
             list_del(&tb->node);
-            if (tb->bp) unregister_hw_breakpoint(tb->bp);
+            if (tb->bp) kfn_unregister_hw_breakpoint(tb->bp);
             kfree(tb);
         }
         kfree(e);
