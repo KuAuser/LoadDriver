@@ -118,6 +118,7 @@ static void hwbp_overflow_handler(struct perf_event *bp,
     struct paradise_hw_breakpoint_hit_info *slot;
     unsigned long flags;
     pid_t cur_tgid;
+    pid_t cur_tid;
 
     if (!bp || !regs) return;
 
@@ -131,6 +132,7 @@ static void hwbp_overflow_handler(struct perf_event *bp,
      * task migrate 异常情况污染 ring. */
     cur_tgid = current ? current->tgid : 0;
     if (cur_tgid != e->target_pid) return;
+    cur_tid = current->pid;             /* task->pid 是 tid (Linux 反着叫) */
 
     /* 入队. handler 上下文不能 sleep, 用 spin_lock_irqsave (跟其他 handler 在
      * 不同 CPU 互斥). lock 内只做定长 memcpy + 4 个标量更新, 短小. */
@@ -145,7 +147,10 @@ static void hwbp_overflow_handler(struct perf_event *bp,
     }
 
     slot = &g_hits_ring[g_hits_head];
-    slot->pid       = cur_tgid;
+    /* slot->pid 历史上叫 pid, 实际填 tid (Linux task->pid). 用户态拿到这个值
+     * 就能区分 sgame 同进程内 274 个 thread 中是哪一个在写坐标 — 后续可
+     * "只装到 hot tid" 进一步减负 (现已默认只装 main thread, 这里仍记录). */
+    slot->pid       = cur_tid;
     slot->timestamp = ktime_get_ns();
     slot->addr      = e->addr;
     /* ARM64: pt_regs 的前 35 个 u64 跟 user_pt_regs 完全一致, 直接 memcpy. */
@@ -171,21 +176,27 @@ static int translate_bp_type(int user_type, int *kernel_bp_type)
     }
 }
 
-/* per-thread 注册时一次最多收集多少 thread (sgame 通常 ~150 个 thread, 256 够用). */
-#define HWBP_MAX_THREADS_PER_ADD 1024
-
+/* hwbp_add: 只装到 target_pid 的 main thread (group leader).
+ *
+ * 设计变更 (2026-04-30):
+ *   v1 装 274 个 thread → 222 万 hit/s, handler 烧 CPU, 游戏卡死.
+ *   v2 改成只装 main thread 一个: hit 频率降到 274 倍以下 (≤ 8 K/s),
+ *      handler CPU 占用 < 0.5%.
+ *
+ *   后果: 如果游戏的写坐标 thread 不是 main thread, hits 会是 0.
+ *   命中后 slot->pid 字段填的是 task->pid (tid), 用户态可以打印分布
+ *   验证是否猜对. 错了再改 IOCTL 让客户端传 tid 自定义.
+ */
 static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
 {
     struct perf_event_attr attr;
     struct hwbp_entry *e;
     struct pid *pidp;
-    struct task_struct *leader, *t;
-    struct task_struct **tasks = NULL;
-    int n_tasks = 0;
+    struct task_struct *leader;
+    struct perf_event *bp;
+    struct hwbp_thread_bp *tb;
     int kernel_bp_type;
     int ret;
-    int i;
-    int reg_ok = 0, reg_fail = 0;
 
     if (target_pid <= 0) return -EINVAL;
     if (addr == 0)       return -EINVAL;
@@ -206,40 +217,17 @@ static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
     }
     mutex_unlock(&g_hwbp_mutex);
 
-    /* 1) 拿到目标进程的 group leader. */
+    /* 拿到目标进程的 group leader (= main thread, task->pid == task->tgid). */
     pidp = find_get_pid(target_pid);
     if (!pidp) return -ESRCH;
     leader = get_pid_task(pidp, PIDTYPE_TGID);
     put_pid(pidp);
     if (!leader) return -ESRCH;
 
-    /* 2) 在 RCU 保护下遍历 thread, 仅 get_task_struct 取引用; register 留到锁外做
-     *    (perf_event_create_kernel_counter 内部会 mutex_lock + 可能 sleep, 不能在 RCU 内调). */
-    tasks = kzalloc(sizeof(*tasks) * HWBP_MAX_THREADS_PER_ADD, GFP_KERNEL);
-    if (!tasks) {
-        put_task_struct(leader);
-        return -ENOMEM;
-    }
-
-    rcu_read_lock();
-    for_each_thread(leader, t) {
-        if (n_tasks >= HWBP_MAX_THREADS_PER_ADD) break;
-        get_task_struct(t);
-        tasks[n_tasks++] = t;
-    }
-    rcu_read_unlock();
-    put_task_struct(leader);
-
-    if (n_tasks == 0) {
-        kfree(tasks);
-        return -ESRCH;
-    }
-
-    /* 3) 分配 entry, 准备 attr. */
+    /* 分配 entry, 准备 attr. */
     e = kzalloc(sizeof(*e), GFP_KERNEL);
     if (!e) {
-        for (i = 0; i < n_tasks; i++) put_task_struct(tasks[i]);
-        kfree(tasks);
+        put_task_struct(leader);
         return -ENOMEM;
     }
     e->target_pid = target_pid;
@@ -254,48 +242,39 @@ static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
     attr.bp_type = kernel_bp_type;
     attr.disabled = 0;
 
-    /* 4) per-thread 注册. 部分 thread 注册失败不致命 (kernel/exiting thread 等会
-     *    被 perf_event 拒掉, 跳过即可). */
-    for (i = 0; i < n_tasks; i++) {
-        struct perf_event *bp;
-        struct hwbp_thread_bp *tb;
-
-        bp = kfn_register_user_hw_breakpoint(&attr, hwbp_overflow_handler, e, tasks[i]);
-        if (IS_ERR_OR_NULL(bp)) {
-            reg_fail++;
-            put_task_struct(tasks[i]);
-            continue;
-        }
-        tb = kzalloc(sizeof(*tb), GFP_KERNEL);
-        if (!tb) {
-            kfn_unregister_hw_breakpoint(bp);
-            reg_fail++;
-            put_task_struct(tasks[i]);
-            continue;
-        }
-        tb->bp  = bp;
-        tb->tid = tasks[i]->pid;
-        list_add(&tb->node, &e->thread_bps);
-        reg_ok++;
-        put_task_struct(tasks[i]);
-    }
-    kfree(tasks);
-
-    if (reg_ok == 0) {
-        paradise_err("hwbp_add: per-thread register all failed (pid=%d addr=0x%lx fail=%d)\n",
-                     target_pid, (unsigned long)addr, reg_fail);
+    /* 只装 main thread 一个. perf_event_create_kernel_counter 内部会 sleep,
+     * 不能在 RCU 内调; 所以我们通过 PIDTYPE_TGID 直接拿到 leader 的 task_struct
+     * 引用, 不进 RCU 也能保引用有效. */
+    bp = kfn_register_user_hw_breakpoint(&attr, hwbp_overflow_handler, e, leader);
+    if (IS_ERR_OR_NULL(bp)) {
+        ret = bp ? PTR_ERR(bp) : -EFAULT;
+        paradise_err("hwbp_add: register on main thread failed: ret=%d (pid=%d tid=%d addr=0x%lx)\n",
+                     ret, target_pid, leader->pid, (unsigned long)addr);
+        put_task_struct(leader);
         kfree(e);
-        return -EFAULT;
+        return ret;
     }
 
-    e->thread_count = reg_ok;
+    tb = kzalloc(sizeof(*tb), GFP_KERNEL);
+    if (!tb) {
+        kfn_unregister_hw_breakpoint(bp);
+        put_task_struct(leader);
+        kfree(e);
+        return -ENOMEM;
+    }
+    tb->bp  = bp;
+    tb->tid = leader->pid;
+    INIT_LIST_HEAD(&tb->node);
+    list_add(&tb->node, &e->thread_bps);
+    e->thread_count = 1;
 
     mutex_lock(&g_hwbp_mutex);
     list_add(&e->node, &g_hwbp_list);
     mutex_unlock(&g_hwbp_mutex);
 
-    paradise_info("hwbp_add: pid=%d addr=0x%lx type=%d len=%d threads=%d (skipped=%d)\n",
-                  target_pid, (unsigned long)addr, type, len, reg_ok, reg_fail);
+    paradise_info("hwbp_add: pid=%d addr=0x%lx type=%d len=%d -> main_thread tid=%d\n",
+                  target_pid, (unsigned long)addr, type, len, leader->pid);
+    put_task_struct(leader);
     return 0;
 }
 
