@@ -28,16 +28,38 @@
 
 /* ============================================================================
  * 数据结构
- * ========================================================================== */
+ * ============================================================================
+ *
+ * 设计变更 (2026-04-29):
+ *   原版用 register_wide_hw_breakpoint() 在每个 CPU 上挂同一条 BP, 命中时再
+ *   在 handler 里按 current->tgid 过滤. 这种做法在"热点指令" (如游戏每秒
+ *   被执行几百万次的 STR X10) 下会让所有 CPU 上的所有进程都触发 ARM64 BP
+ *   异常, handler 即使立刻 return 也已付出 trap → IRQ 切换的几千周期, 8 核
+ *   被异常吞掉, 目标进程直接 hung 60s+.
+ *
+ *   现版本改成 register_user_hw_breakpoint() 给目标进程**每个线程**单独挂
+ *   一条 BP, 异常只会发生在目标进程的 task 上, 跟原 perf_event_open 后端
+ *   的 per-thread 模式完全等价, CPU 不会被其它进程的 unrelated 命中拖死.
+ *
+ *   缺点: 在 ADD 时刻已存在的 thread 才会被覆盖. 之后新创建的 thread 不会
+ *   自动挂上 BP. 对游戏来说这通常无所谓 — 写坐标的那个线程在游戏初始化
+ *   阶段就 spawn 了, 我们 ADD 时已存在.
+ */
 
-/* 一条已注册的硬件断点. CPU-wide, 一个 entry 对应所有 CPU 上的 perf_event 数组. */
+struct hwbp_thread_bp {
+    struct list_head node;
+    pid_t            tid;                   /* 注册时的 task->pid */
+    struct perf_event *bp;                  /* register_user_hw_breakpoint 返回 */
+};
+
 struct hwbp_entry {
     struct list_head node;
-    pid_t target_pid;                       /* hit handler 用来过滤 */
+    pid_t target_pid;                       /* tgid, hit handler 仍按它过滤兜底 */
     uintptr_t addr;
     int type;                               /* HW_BP_TYPE_* */
     int len;
-    struct perf_event * __percpu *events;   /* register_wide_hw_breakpoint 返回 */
+    struct list_head thread_bps;            /* hwbp_thread_bp 链, 一个 thread 一条 */
+    int thread_count;                       /* 注册成功的 thread 个数 */
 };
 
 static LIST_HEAD(g_hwbp_list);
@@ -72,13 +94,14 @@ static void hwbp_overflow_handler(struct perf_event *bp,
 
     if (!bp || !regs) return;
 
-    /* register_wide_hw_breakpoint 把 context 设到每 cpu perf_event 的
+    /* register_user_hw_breakpoint 把 context 设到 perf_event 的
      * overflow_handler_context 上. 我们在 add 路径传的就是 hwbp_entry*. */
     e = (struct hwbp_entry *)bp->overflow_handler_context;
     if (!e) return;
 
-    /* 过滤: 只接目标进程 tgid (handler 跑在被中断 task 的上下文, current 是它).
-     * 跨进程 same-VA 命中 (例如分身进程) 直接丢弃, 不污染 ring. */
+    /* per-thread 模式下 BP 已经只可能在目标进程的某个 thread 上触发, 不再需要
+     * tgid 过滤兜底; 但保留一行硬性 sanity check, 防止 (理论上不会发生的)
+     * task migrate 异常情况污染 ring. */
     cur_tgid = current ? current->tgid : 0;
     if (cur_tgid != e->target_pid) return;
 
@@ -121,13 +144,21 @@ static int translate_bp_type(int user_type, int *kernel_bp_type)
     }
 }
 
+/* per-thread 注册时一次最多收集多少 thread (sgame 通常 ~150 个 thread, 256 够用). */
+#define HWBP_MAX_THREADS_PER_ADD 1024
+
 static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
 {
     struct perf_event_attr attr;
     struct hwbp_entry *e;
-    struct perf_event * __percpu *events;
+    struct pid *pidp;
+    struct task_struct *leader, *t;
+    struct task_struct **tasks = NULL;
+    int n_tasks = 0;
     int kernel_bp_type;
     int ret;
+    int i;
+    int reg_ok = 0, reg_fail = 0;
 
     if (target_pid <= 0) return -EINVAL;
     if (addr == 0)       return -EINVAL;
@@ -148,12 +179,47 @@ static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
     }
     mutex_unlock(&g_hwbp_mutex);
 
+    /* 1) 拿到目标进程的 group leader. */
+    pidp = find_get_pid(target_pid);
+    if (!pidp) return -ESRCH;
+    leader = get_pid_task(pidp, PIDTYPE_TGID);
+    put_pid(pidp);
+    if (!leader) return -ESRCH;
+
+    /* 2) 在 RCU 保护下遍历 thread, 仅 get_task_struct 取引用; register 留到锁外做
+     *    (perf_event_create_kernel_counter 内部会 mutex_lock + 可能 sleep, 不能在 RCU 内调). */
+    tasks = kzalloc(sizeof(*tasks) * HWBP_MAX_THREADS_PER_ADD, GFP_KERNEL);
+    if (!tasks) {
+        put_task_struct(leader);
+        return -ENOMEM;
+    }
+
+    rcu_read_lock();
+    for_each_thread(leader, t) {
+        if (n_tasks >= HWBP_MAX_THREADS_PER_ADD) break;
+        get_task_struct(t);
+        tasks[n_tasks++] = t;
+    }
+    rcu_read_unlock();
+    put_task_struct(leader);
+
+    if (n_tasks == 0) {
+        kfree(tasks);
+        return -ESRCH;
+    }
+
+    /* 3) 分配 entry, 准备 attr. */
     e = kzalloc(sizeof(*e), GFP_KERNEL);
-    if (!e) return -ENOMEM;
+    if (!e) {
+        for (i = 0; i < n_tasks; i++) put_task_struct(tasks[i]);
+        kfree(tasks);
+        return -ENOMEM;
+    }
     e->target_pid = target_pid;
     e->addr = addr;
     e->type = type;
     e->len = len;
+    INIT_LIST_HEAD(&e->thread_bps);
 
     hw_breakpoint_init(&attr);
     attr.bp_addr = addr;
@@ -161,30 +227,55 @@ static int hwbp_add(pid_t target_pid, uintptr_t addr, int type, int len)
     attr.bp_type = kernel_bp_type;
     attr.disabled = 0;
 
-    /* CPU-wide: 内核给每个 CPU 装一个 perf_event, 任意 CPU 上跑到这条指令都
-     * 触发 handler. 不绑特定 task, 新 thread 自动覆盖. */
-    events = register_wide_hw_breakpoint(&attr, hwbp_overflow_handler, e);
-    if (IS_ERR_OR_NULL(events)) {
-        ret = events ? PTR_ERR(events) : -EFAULT;
-        paradise_err("register_wide_hw_breakpoint failed: %d (pid=%d addr=0x%lx type=%d len=%d)\n",
-                     ret, target_pid, (unsigned long)addr, type, len);
-        kfree(e);
-        return ret;
+    /* 4) per-thread 注册. 部分 thread 注册失败不致命 (kernel/exiting thread 等会
+     *    被 perf_event 拒掉, 跳过即可). */
+    for (i = 0; i < n_tasks; i++) {
+        struct perf_event *bp;
+        struct hwbp_thread_bp *tb;
+
+        bp = register_user_hw_breakpoint(&attr, hwbp_overflow_handler, e, tasks[i]);
+        if (IS_ERR_OR_NULL(bp)) {
+            reg_fail++;
+            put_task_struct(tasks[i]);
+            continue;
+        }
+        tb = kzalloc(sizeof(*tb), GFP_KERNEL);
+        if (!tb) {
+            unregister_hw_breakpoint(bp);
+            reg_fail++;
+            put_task_struct(tasks[i]);
+            continue;
+        }
+        tb->bp  = bp;
+        tb->tid = tasks[i]->pid;
+        list_add(&tb->node, &e->thread_bps);
+        reg_ok++;
+        put_task_struct(tasks[i]);
     }
-    e->events = events;
+    kfree(tasks);
+
+    if (reg_ok == 0) {
+        paradise_err("hwbp_add: per-thread register all failed (pid=%d addr=0x%lx fail=%d)\n",
+                     target_pid, (unsigned long)addr, reg_fail);
+        kfree(e);
+        return -EFAULT;
+    }
+
+    e->thread_count = reg_ok;
 
     mutex_lock(&g_hwbp_mutex);
     list_add(&e->node, &g_hwbp_list);
     mutex_unlock(&g_hwbp_mutex);
 
-    paradise_info("hwbp_add: pid=%d addr=0x%lx type=%d len=%d ok\n",
-                  target_pid, (unsigned long)addr, type, len);
+    paradise_info("hwbp_add: pid=%d addr=0x%lx type=%d len=%d threads=%d (skipped=%d)\n",
+                  target_pid, (unsigned long)addr, type, len, reg_ok, reg_fail);
     return 0;
 }
 
 static int hwbp_remove(pid_t target_pid, uintptr_t addr)
 {
     struct hwbp_entry *e, *tmp, *found = NULL;
+    struct hwbp_thread_bp *tb, *tb_tmp;
 
     mutex_lock(&g_hwbp_mutex);
     list_for_each_entry_safe(e, tmp, &g_hwbp_list, node) {
@@ -202,8 +293,12 @@ static int hwbp_remove(pid_t target_pid, uintptr_t addr)
         return -ENOENT;
     }
 
-    /* unregister_wide_hw_breakpoint 可能 sleep, 必须在锁外调. */
-    unregister_wide_hw_breakpoint(found->events);
+    /* unregister_hw_breakpoint 可能 sleep, 必须在锁外调. */
+    list_for_each_entry_safe(tb, tb_tmp, &found->thread_bps, node) {
+        list_del(&tb->node);
+        if (tb->bp) unregister_hw_breakpoint(tb->bp);
+        kfree(tb);
+    }
     kfree(found);
 
     paradise_info("hwbp_remove: pid=%d addr=0x%lx ok\n",
@@ -304,13 +399,16 @@ int paradise_hwbp_init(void)
 void paradise_hwbp_exit(void)
 {
     struct hwbp_entry *e, *tmp;
+    struct hwbp_thread_bp *tb, *tb_tmp;
 
     mutex_lock(&g_hwbp_mutex);
     list_for_each_entry_safe(e, tmp, &g_hwbp_list, node) {
         list_del(&e->node);
-        /* unregister 可能 sleep, mutex 持有期间不能 sleep? mutex 可以 sleep, 没问题.
-         * (非 spinlock, 内核里 mutex 持有时是允许调度的). */
-        unregister_wide_hw_breakpoint(e->events);
+        list_for_each_entry_safe(tb, tb_tmp, &e->thread_bps, node) {
+            list_del(&tb->node);
+            if (tb->bp) unregister_hw_breakpoint(tb->bp);
+            kfree(tb);
+        }
         kfree(e);
     }
     mutex_unlock(&g_hwbp_mutex);
